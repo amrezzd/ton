@@ -28,8 +28,8 @@ td::Result<std::unique_ptr<BroadcastFec>> BroadcastFec::create(Overlay::Broadcas
                                                                Overlay::BroadcastDataHash data_hash, td::uint32 flags,
                                                                td::uint32 date, fec::FecType fec_type) {
   auto F = std::make_unique<BroadcastFec>(hash, std::move(src), data_hash, flags, date, std::move(fec_type));
-  TRY_STATUS(F->init_fec_type());
   TRY_STATUS(F->run_checks());
+  TRY_STATUS(F->init_fec_type());
   return std::move(F);
 }
 
@@ -78,7 +78,6 @@ td::Status OverlayFecBroadcastPart::check_signature() {
 }
 
 td::Status OverlayFecBroadcastPart::run_checks() {
-
   TRY_STATUS(check_time());
   TRY_STATUS(check_duplicate());
   TRY_STATUS(check_source());
@@ -88,19 +87,23 @@ td::Status OverlayFecBroadcastPart::run_checks() {
 
 void BroadcastFec::broadcast_checked(td::Result<td::Unit> R) {
   if (R.is_error()) {
+    td::actor::send_closure(actor_id(overlay_), &OverlayImpl::update_peer_err_ctr, src_peer_id_, true);
     return;
   }
   overlay_->deliver_broadcast(get_source().compute_short_id(), data_.clone());
   auto manager = overlay_->overlay_manager();
   while (!parts_.empty()) {
-       distribute_part(parts_.begin()->first);
+    distribute_part(parts_.begin()->first);
   }
+
+  is_checked_ = true;
 }
 
 // Do we need status here??
-td::Status  BroadcastFec::distribute_part(td::uint32 seqno) {
+td::Status BroadcastFec::distribute_part(td::uint32 seqno) {
   auto i = parts_.find(seqno);
   if (i == parts_.end()) {
+    VLOG(OVERLAY_WARNING) << "not distibuting empty part " << seqno;
     // should not get here
     return td::Status::OK();
   }
@@ -109,7 +112,7 @@ td::Status  BroadcastFec::distribute_part(td::uint32 seqno) {
   td::BufferSlice data_short = std::move(tls.first);
   td::BufferSlice data = std::move(tls.second);
 
-  auto nodes = overlay_->get_neighbours(5);
+  auto nodes = overlay_->get_neighbours(overlay_->propagate_broadcast_to());
   auto manager = overlay_->overlay_manager();
 
   for (auto &n : nodes) {
@@ -131,7 +134,6 @@ td::Status  BroadcastFec::distribute_part(td::uint32 seqno) {
 }
 
 td::Status OverlayFecBroadcastPart::apply() {
-
   if (!bcast_) {
     bcast_ = overlay_->get_fec_broadcast(broadcast_hash_);
   }
@@ -155,6 +157,7 @@ td::Status OverlayFecBroadcastPart::apply() {
 
   if (!bcast_->finalized()) {
     bcast_->set_overlay(overlay_);
+    bcast_->set_src_peer_id(src_peer_id_);
     TRY_STATUS(bcast_->add_part(seqno_, data_.clone(), export_serialized_short(), export_serialized()));
     auto R = bcast_->finish();
     if (R.is_error()) {
@@ -163,16 +166,20 @@ td::Status OverlayFecBroadcastPart::apply() {
         return S;
       }
     } else {
-      if(untrusted_) {
+      if (untrusted_) {
         auto P = td::PromiseCreator::lambda(
-              [id = broadcast_hash_, overlay_id = actor_id(overlay_)](td::Result<td::Unit> RR) mutable {
-                td::actor::send_closure(std::move(overlay_id), &OverlayImpl::broadcast_checked, id, std::move(RR));
-              });
+            [id = broadcast_hash_, overlay_id = actor_id(overlay_)](td::Result<td::Unit> RR) mutable {
+              td::actor::send_closure(std::move(overlay_id), &OverlayImpl::broadcast_checked, id, std::move(RR));
+            });
         overlay_->check_broadcast(bcast_->get_source().compute_short_id(), R.move_as_ok(), std::move(P));
       } else {
         overlay_->deliver_broadcast(bcast_->get_source().compute_short_id(), R.move_as_ok());
       }
     }
+  } else {
+    bcast_->set_overlay(overlay_);
+    bcast_->set_src_peer_id(src_peer_id_);
+    TRY_STATUS(bcast_->add_part(seqno_, data_.clone(), export_serialized_short(), export_serialized()));
   }
   return td::Status::OK();
 }
@@ -211,7 +218,7 @@ td::BufferSlice OverlayFecBroadcastPart::to_sign() {
   return serialize_tl_object(obj, true);
 }
 
-td::Status OverlayFecBroadcastPart::create(OverlayImpl *overlay,
+td::Status OverlayFecBroadcastPart::create(OverlayImpl *overlay, adnl::AdnlNodeIdShort src_peer_id,
                                            tl_object_ptr<ton_api::overlay_broadcastFec> broadcast) {
   TRY_STATUS(overlay->check_date(broadcast->date_));
   auto source = PublicKey{broadcast->src_};
@@ -244,12 +251,13 @@ td::Status OverlayFecBroadcastPart::create(OverlayImpl *overlay,
                             std::move(broadcast->signature_),
                             false,
                             overlay->get_fec_broadcast(broadcast_hash),
-                            overlay};
+                            overlay,
+                            src_peer_id};
   TRY_STATUS(B.run());
   return td::Status::OK();
 }
 
-td::Status OverlayFecBroadcastPart::create(OverlayImpl *overlay,
+td::Status OverlayFecBroadcastPart::create(OverlayImpl *overlay, adnl::AdnlNodeIdShort src_peer_id,
                                            tl_object_ptr<ton_api::overlay_broadcastFecShort> broadcast) {
   auto bcast = overlay->get_fec_broadcast(broadcast->broadcast_hash_);
   if (!bcast) {
@@ -285,7 +293,8 @@ td::Status OverlayFecBroadcastPart::create(OverlayImpl *overlay,
                             std::move(broadcast->signature_),
                             true,
                             bcast,
-                            overlay};
+                            overlay,
+                            src_peer_id};
   TRY_STATUS(B.run());
   return td::Status::OK();
 }
@@ -300,7 +309,8 @@ td::Status OverlayFecBroadcastPart::create_new(OverlayImpl *overlay, td::actor::
 
   auto B = std::make_unique<OverlayFecBroadcastPart>(
       broadcast_hash, part_hash, PublicKey{}, overlay->get_certificate(local_id), data_hash, size, flags,
-      part_data_hash, std::move(part), seqno, std::move(fec_type), date, td::BufferSlice{}, false, nullptr, overlay);
+      part_data_hash, std::move(part), seqno, std::move(fec_type), date, td::BufferSlice{}, false, nullptr, overlay,
+      adnl::AdnlNodeIdShort::zero());
   auto to_sign = B->to_sign();
 
   auto P = td::PromiseCreator::lambda(

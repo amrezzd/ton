@@ -82,15 +82,15 @@ class BroadcastFec : public td::ListNode {
     }
   }
 
-  td::Status add_part(td::uint32 seqno, td::BufferSlice data,
-                      td::BufferSlice serialized_fec_part_short,
+  td::Status add_part(td::uint32 seqno, td::BufferSlice data, td::BufferSlice serialized_fec_part_short,
                       td::BufferSlice serialized_fec_part) {
-    CHECK(decoder_);
-    td::fec::Symbol s;
-    s.id = seqno;
-    s.data = std::move(data);
+    if (decoder_) {
+      td::fec::Symbol s;
+      s.id = seqno;
+      s.data = std::move(data);
 
-    decoder_->add_symbol(std::move(s));
+      decoder_->add_symbol(std::move(s));
+    }
     parts_[seqno] = std::pair<td::BufferSlice, td::BufferSlice>(std::move(serialized_fec_part_short),
                                                                 std::move(serialized_fec_part));
 
@@ -194,11 +194,19 @@ class BroadcastFec : public td::ListNode {
   void set_overlay(OverlayImpl *overlay) {
     overlay_ = overlay;
   }
+  void set_src_peer_id(adnl::AdnlNodeIdShort src_peer_id) {
+    src_peer_id_ = src_peer_id;
+  }
 
   td::Status distribute_part(td::uint32 seqno);
 
+  bool is_checked() const {
+    return is_checked_;
+  }
+
  private:
   bool ready_ = false;
+  bool is_checked_ = false;
 
   Overlay::BroadcastHash hash_;
   Overlay::BroadcastDataHash data_hash_;
@@ -220,6 +228,7 @@ class BroadcastFec : public td::ListNode {
 
   std::map<td::uint32, std::pair<td::BufferSlice, td::BufferSlice>> parts_;
   OverlayImpl *overlay_;
+  adnl::AdnlNodeIdShort src_peer_id_ = adnl::AdnlNodeIdShort::zero();
   td::BufferSlice data_;
 };
 
@@ -245,6 +254,7 @@ class OverlayFecBroadcastPart : public td::ListNode {
 
   BroadcastFec *bcast_;
   OverlayImpl *overlay_;
+  adnl::AdnlNodeIdShort src_peer_id_ = adnl::AdnlNodeIdShort::zero();
 
   td::Status check_time();
   td::Status check_duplicate();
@@ -260,7 +270,7 @@ class OverlayFecBroadcastPart : public td::ListNode {
                           std::shared_ptr<Certificate> cert, Overlay::BroadcastDataHash data_hash, td::uint32 data_size,
                           td::uint32 flags, Overlay::BroadcastDataHash part_data_hash, td::BufferSlice data,
                           td::uint32 seqno, fec::FecType fec_type, td::uint32 date, td::BufferSlice signature,
-                          bool is_short, BroadcastFec *bcast, OverlayImpl *overlay)
+                          bool is_short, BroadcastFec *bcast, OverlayImpl *overlay, adnl::AdnlNodeIdShort src_peer_id)
       : broadcast_hash_(broadcast_hash)
       , part_hash_(part_hash)
       , source_(std::move(source))
@@ -276,7 +286,8 @@ class OverlayFecBroadcastPart : public td::ListNode {
       , signature_(std::move(signature))
       , is_short_(is_short)
       , bcast_(bcast)
-      , overlay_(overlay) {
+      , overlay_(overlay)
+      , src_peer_id_(src_peer_id) {
   }
 
   td::uint32 data_size() const {
@@ -294,7 +305,7 @@ class OverlayFecBroadcastPart : public td::ListNode {
     signature_ = std::move(signature);
   }
   void update_overlay(OverlayImpl *overlay);
-  
+
   tl_object_ptr<ton_api::overlay_broadcastFec> export_tl();
   tl_object_ptr<ton_api::overlay_broadcastFecShort> export_tl_short();
   td::BufferSlice export_serialized();
@@ -304,14 +315,16 @@ class OverlayFecBroadcastPart : public td::ListNode {
   td::Status run() {
     TRY_STATUS(run_checks());
     TRY_STATUS(apply());
-    if(!untrusted_) {
+    if (!untrusted_ || bcast_->is_checked()) {
       TRY_STATUS(distribute());
     }
     return td::Status::OK();
   }
 
-  static td::Status create(OverlayImpl *overlay, tl_object_ptr<ton_api::overlay_broadcastFec> broadcast);
-  static td::Status create(OverlayImpl *overlay, tl_object_ptr<ton_api::overlay_broadcastFecShort> broadcast);
+  static td::Status create(OverlayImpl *overlay, adnl::AdnlNodeIdShort src_peer_id,
+                           tl_object_ptr<ton_api::overlay_broadcastFec> broadcast);
+  static td::Status create(OverlayImpl *overlay, adnl::AdnlNodeIdShort src_peer_id,
+                           tl_object_ptr<ton_api::overlay_broadcastFecShort> broadcast);
   static td::Status create_new(OverlayImpl *overlay, td::actor::ActorId<OverlayImpl> overlay_actor_id,
                                PublicKeyHash local_id, Overlay::BroadcastDataHash data_hash, td::uint32 size,
                                td::uint32 flags, td::BufferSlice part, td::uint32 seqno, fec::FecType fec_type,
